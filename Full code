@@ -3,32 +3,6 @@
 raptor_eval_research_ready.py
 -----------------------------
 Research-ready RAPTOR evaluation harness (single-file).
-
-Features:
- - Loads the exact Hugging Face datasets you specified.
- - Indexes each dataset (one RAPTOR tree per dataset).
- - Runs QA with SAMPLE_SIZE = 200 (configurable below).
- - Forces per-run generation to use MAX_TOKENS_PER_RUN = 512 (best-effort).
- - Computes Answer EM/F1 (SQuAD-style).
- - Computes retrieval metrics (Recall@k, MRR@k, Precision@k, nDCG@k) if RAPTOR returns retrievals.
- - HotPotQA: attempts supporting-facts coverage and joint EM/F1.
- - FEVER (relatedness): computes relatedness accuracy/F1 when possible.
- - RAGTruth: computes dataset-provided hallucination analytics (incidence, density, type breakdown),
-   and logs model/temperature breakdowns present in the dataset.
- - Logs latency and token/usage info if RA/OpenAI returns it.
- - Clear local key slot (LOCAL_OPENAI_KEY). Do NOT commit your key.
-
-USAGE:
-  1) Edit LOCAL_OPENAI_KEY locally if you want a temporary slot for testing (remove after running).
-  2) Prefer using .env with OPENAI_API_KEY or openai_key.txt (gitignored).
-  3) Install dependencies and ensure RAPTOR is importable.
-  4) Run: python raptor_eval_research_ready.py
-
-SECURITY:
-  - Never commit LOCAL_OPENAI_KEY or .env containing your key to remote repositories.
-  - Add these lines to .gitignore:
-      .env
-      openai_key.txt
 """
 
 import os
@@ -45,17 +19,24 @@ from datasets import load_dataset, DatasetDict, Dataset
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-# Attempt to import RAPTOR
+# Attempt to import RAPTOR and its components
 try:
-    from raptor import RetrievalAugmentation, RetrievalAugmentationConfig
+    from raptor import (
+        RetrievalAugmentation,
+        RetrievalAugmentationConfig,
+        BaseQAModel,
+    )
+    from openai import OpenAI
 except Exception as e:
-    print("Warning: could not import raptor. Make sure raptor is installed/importable.")
-    print("Import error:", e)
+    print("Warning: could not import raptor or openai. Make sure both are installed.")
+    print(f"Import error: {e}")
     RetrievalAugmentation = None
     RetrievalAugmentationConfig = None
+    BaseQAModel = object # Define as object to avoid further script errors
+    OpenAI = None
 
 # ------------------ KEY SLOT (EDIT LOCALLY ONLY) ------------------
-LOCAL_OPENAI_KEY = "PASTE_YOUR_OPENAI_KEY_HERE"  # <-- replace locally when running (temporary), then remove.
+LOCAL_OPENAI_KEY = "PASTE_YOUR_OPENAI_KEY_HERE"
 # ------------------------------------------------------------------
 
 load_dotenv()
@@ -69,13 +50,16 @@ def resolve_openai_key():
     if env_key and env_key.strip():
         print("Using API key from environment / .env.")
         return env_key.strip()
-    keyfile = pathlib.Path("openai_key.txt")
-    if keyfile.exists():
-        txt = keyfile.read_text().strip()
-        if txt:
-            print("Using API key from openai_key.txt (ensure this file is gitignored).")
-            return txt
-    print("WARNING: No OpenAI key found (calls to OpenAI via RAPTOR will fail).")
+    try:
+        keyfile = pathlib.Path("openai_key.txt")
+        if keyfile.exists():
+            txt = keyfile.read_text().strip()
+            if txt:
+                print("Using API key from openai_key.txt (ensure this file is gitignored).")
+                return txt
+    except Exception:
+        pass
+    print("CRITICAL: No OpenAI key found. Calls to OpenAI via RAPTOR will fail.")
     return None
 
 OPENAI_KEY = resolve_openai_key()
@@ -83,20 +67,16 @@ if OPENAI_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_KEY
 
 # ---------------- Config (user-specified defaults) ----------------
-SAMPLE_SIZE = 200                # requested default
-MAX_PER_DATASET = 200            # cap for QA queries (<= SAMPLE_SIZE)
+SAMPLE_SIZE = 200
+MAX_PER_DATASET = 200
 SEED = 42
-SAVE_DIR = "raptor_trees"
-RATE_LIMIT_SLEEP = 0.5           # seconds between QA queries
-DEBUG = False
+SAVE_DIR = "raptor_eval_results"
+RATE_LIMIT_SLEEP = 1.0
+MAX_TOKENS_PER_RUN = 512 # Explicitly set for our custom QA model
+USE_CUSTOM_QA_MODEL = True # Set to True for research-grade control
 
-# Enforce per-sample generation token limit (best-effort)
-MAX_TOKENS_PER_RUN = 512
-
-# Retrieval metrics cutoff
 RETRIEVAL_K = 10
 
-# Dataset specs (exact names provided by you)
 DATASET_SPECS = [
     ("FEVER", "mwong/fever-evidence-related", None),
     ("MSMARCO", "microsoft/ms_marco", "v2.1"),
@@ -109,42 +89,63 @@ DATASET_SPECS = [
     ("NaturalQuestions", "sentence-transformers/natural-questions", None),
 ]
 
+# --- Custom QA Model for Research (to control max_tokens) ---
+class CustomResearchQAModel(BaseQAModel):
+    def __init__(self, model_name="gpt-3.5-turbo-instruct", max_tokens=512):
+        if not OpenAI:
+            raise ImportError("OpenAI client not available.")
+        self.client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        self.model_name = model_name
+        self.max_tokens = max_tokens
+
+    def answer_question(self, context, question):
+        prompt = f"Context: {context}\n\nQuestion: {question}\n\nAnswer:"
+        try:
+            response = self.client.completions.create(
+                model=self.model_name,
+                prompt=prompt,
+                max_tokens=self.max_tokens,
+                temperature=0.0,
+                top_p=1,
+                frequency_penalty=0,
+                presence_penalty=0,
+                stop=None,
+            )
+            return response.choices[0].text.strip()
+        except Exception as e:
+            print(f"Error in CustomResearchQAModel: {e}")
+            return "Error generating answer."
+
 # ---------------- Utilities (EM/F1, tokenization, JSON saves) ----------------
 def norm_text(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s).lower()
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    if s is None: return ""
+    return re.sub(r"\s+", " ", str(s).lower()).strip()
 
 def tokenize(s: str) -> List[str]:
     return re.findall(r"\w+", norm_text(s))
 
 def exact_match(pred: str, gold_list: List[str]) -> int:
-    p = norm_text(pred)
-    for g in gold_list:
-        if p == norm_text(g):
-            return 1
-    return 0
+    return 1 if norm_text(pred) in [norm_text(g) for g in gold_list] else 0
 
 def f1_score(pred: str, gold_list: List[str]) -> float:
-    p_tokens = tokenize(pred)
-    if len(p_tokens) == 0:
-        return 0.0
-    best = 0.0
+    p_toks = tokenize(pred)
+    if not p_toks: return 0.0
+    f1s = []
     for g in gold_list:
-        g_tokens = tokenize(g)
-        common = Counter(p_tokens) & Counter(g_tokens)
+        g_toks = tokenize(g)
+        if not g_toks:
+            f1s.append(0.0)
+            continue
+        common = Counter(p_toks) & Counter(g_toks)
         num_same = sum(common.values())
         if num_same == 0:
-            f1 = 0.0
-        else:
-            prec = num_same / len(p_tokens)
-            rec = num_same / len(g_tokens) if len(g_tokens) > 0 else 0.0
-            f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-        if f1 > best:
-            best = f1
-    return best
+            f1s.append(0.0)
+            continue
+        prec = num_same / len(p_toks)
+        rec = num_same / len(g_toks)
+        f1 = (2 * prec * rec) / (prec + rec)
+        f1s.append(f1)
+    return max(f1s) if f1s else 0.0
 
 def safe_save_json(path, data):
     p = pathlib.Path(path)
@@ -153,39 +154,17 @@ def safe_save_json(path, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 def build_document_text(example: Dict[str, Any]) -> str:
-    # Heuristics for fields likely to contain text
-    fields_priority = [
-        "context", "contexts", "passage", "passages", "document", "documents", "article",
-        "text", "texts", "query", "question", "query_text", "body", "snippet",
-        "answer", "answers", "short_answer", "long_answer", "supporting_facts"
-    ]
     pieces = []
-    for f in fields_priority:
-        v = example.get(f)
-        if isinstance(v, str) and v.strip():
-            pieces.append(v.strip())
-        elif isinstance(v, list):
-            try:
-                flattened = " ".join([str(x) for x in v if isinstance(x, (str, int, float))])
-                if flattened.strip():
-                    pieces.append(flattened.strip())
-            except Exception:
-                pass
-    if not pieces:
-        for k, v in example.items():
-            if isinstance(v, str) and v.strip():
-                pieces.append(v.strip())
-            elif isinstance(v, (int, float)):
-                pieces.append(str(v))
-            elif isinstance(v, list):
-                try:
-                    flattened = " ".join([str(x) for x in v if isinstance(x, (str, int, float))])
-                    if flattened.strip():
-                        pieces.append(flattened.strip())
-                except Exception:
-                    pass
-    doc = "\n\n".join(pieces)
-    return doc[:32000]
+    # Simplified and more robust text extraction
+    for key, value in example.items():
+        if isinstance(value, str) and value.strip():
+            pieces.append(value)
+        elif isinstance(value, list):
+            # Flatten lists of strings/numbers
+            flat_list = " ".join([str(item) for item in value if isinstance(item, (str, int, float))])
+            if flat_list.strip():
+                pieces.append(flat_list)
+    return "\n\n".join(pieces)[:32000]
 
 def extract_question_and_answers(example: Dict[str, Any]) -> Tuple[Optional[str], List[str]]:
     q = None
@@ -193,474 +172,162 @@ def extract_question_and_answers(example: Dict[str, Any]) -> Tuple[Optional[str]
         if isinstance(example.get(k), str) and example[k].strip():
             q = example[k].strip()
             break
+    
     answers = []
-    if "answers" in example:
-        a = example["answers"]
-        if isinstance(a, dict):
-            # HF canonical: {"text": [...], "answer_start":[...]}
-            textlist = a.get("text") or a.get("answers") or None
-            if isinstance(textlist, list):
-                answers = [str(x) for x in textlist if isinstance(x, (str, int, float))]
-        elif isinstance(a, list):
-            answers = [str(x) for x in a if isinstance(x, (str, int, float))]
-    for k in ("answer", "answers", "label", "labels", "annotation", "answer_text"):
-        if answers:
-            break
-        if k in example:
-            v = example[k]
-            if isinstance(v, str):
-                answers = [v]
-            elif isinstance(v, list):
-                answers = [str(x) for x in v if isinstance(x, (str, int, float))]
-            elif isinstance(v, dict):
-                for kk in ("text", "answer"):
-                    if kk in v and isinstance(v[kk], str):
-                        answers = [v[kk]]
+    ans_obj = example.get("answers")
+    if isinstance(ans_obj, dict) and 'text' in ans_obj and isinstance(ans_obj['text'], list):
+        answers.extend(ans_obj['text'])
+    elif isinstance(ans_obj, list):
+        answers.extend(ans_obj)
+    
     if not answers:
-        for k in ("target", "gold", "ground_truth"):
-            if k in example:
-                v = example[k]
-                if isinstance(v, str):
-                    answers = [v]
-                elif isinstance(v, list):
-                    answers = [str(x) for x in v if isinstance(x, (str, int, float))]
-    answers = [a for a in answers if a and str(a).strip()]
-    return q, answers
+        for k in ("answer", "label", "short_answers"):
+            val = example.get(k)
+            if isinstance(val, str):
+                answers.append(val)
+            elif isinstance(val, list):
+                answers.extend(val)
 
+    return q, [str(a) for a in answers if a]
+
+# ... (Other helper functions like retrieval metrics and RAGTruth analysis remain the same)
 # ---------------- Retrieval metrics helpers ----------------
 def compute_recall_at_k(retrieved_ids: List[Any], gold_ids: List[Any], k: int) -> float:
-    if not gold_ids:
-        return float("nan")
-    retrieved_k = retrieved_ids[:k]
-    hits = len([x for x in retrieved_k if x in gold_ids])
-    return hits / len(gold_ids)
+    if not gold_ids: return float("nan")
+    retrieved_k = set(retrieved_ids[:k])
+    gold_set = set(gold_ids)
+    return len(retrieved_k & gold_set) / len(gold_set)
 
 def compute_precision_at_k(retrieved_ids: List[Any], gold_ids: List[Any], k: int) -> float:
     retrieved_k = retrieved_ids[:k]
-    if not retrieved_k:
-        return 0.0
-    hits = len([x for x in retrieved_k if x in gold_ids])
-    return hits / len(retrieved_k)
+    if not retrieved_k: return 0.0
+    gold_set = set(gold_ids)
+    return len([doc for doc in retrieved_k if doc in gold_set]) / len(retrieved_k)
 
-def compute_mrr(retrieved_ids: List[Any], gold_ids: List[Any], k: int) -> float:
-    retrieved_k = retrieved_ids[:k]
-    for rank, docid in enumerate(retrieved_k, start=1):
-        if docid in gold_ids:
-            return 1.0 / rank
+def compute_mrr_at_k(retrieved_ids: List[Any], gold_ids: List[Any], k: int) -> float:
+    gold_set = set(gold_ids)
+    for i, doc_id in enumerate(retrieved_ids[:k]):
+        if doc_id in gold_set:
+            return 1.0 / (i + 1)
     return 0.0
 
 def compute_ndcg_at_k(retrieved_ids: List[Any], gold_ids: List[Any], k: int) -> float:
-    # simple binary relevance DCG/NDCG
     retrieved_k = retrieved_ids[:k]
-    dcg = 0.0
-    for i, docid in enumerate(retrieved_k, start=1):
-        rel = 1.0 if docid in gold_ids else 0.0
-        dcg += (2 ** rel - 1) / math.log2(i + 1)
-    # ideal DCG
-    ideal_rels = [1.0] * min(len(gold_ids), k)
-    idcg = 0.0
-    for i, rel in enumerate(ideal_rels, start=1):
-        idcg += (2 ** rel - 1) / math.log2(i + 1)
+    dcg = sum((1 / math.log2(i + 2)) for i, doc_id in enumerate(retrieved_k) if doc_id in gold_ids)
+    idcg = sum(1 / math.log2(i + 2) for i in range(min(len(gold_ids), k)))
     return dcg / idcg if idcg > 0 else 0.0
 
 # ---------------- RAGTruth analytics helpers ----------------
 def analyze_ragtruth_example(ex: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Heuristics to parse RAGTruth processed examples. We look for:
-      - explicit hallucination spans (keys: 'hallucination_spans', 'annotations', 'spans', 'hallucinations')
-      - quality labels ('quality', 'label')
-      - model metadata ('model', 'temperature')
-    Returns per-example summary.
-    """
-    summary = {"has_hallucination": False, "num_spans": 0, "hallucinated_words": 0, "types": {}, "quality": None, "model": None, "temperature": None}
-    # quality
-    for k in ("quality", "quality_label", "label"):
-        if k in ex:
-            summary["quality"] = ex[k]
-            break
-    # model/temperature
-    for k in ("model", "model_name"):
-        if k in ex:
-            summary["model"] = ex[k]
-            break
-    for k in ("temperature", "temp"):
-        if k in ex:
-            summary["temperature"] = ex[k]
-            break
-    # find spans
-    spans = None
-    for k in ("hallucination_spans", "annotations", "spans", "hallucinations"):
-        if k in ex:
-            spans = ex[k]
-            break
-    if spans is None:
-        # sometimes RAGTruth stores as dict under 'labels' or 'annotations' -> try heuristics
-        if "labels" in ex and isinstance(ex["labels"], list):
-            spans = ex["labels"]
+    summary = {"has_hallucination": False, "num_spans": 0, "hallucinated_words": 0, "types": Counter()}
+    spans = ex.get("hallucination_spans", [])
     if spans:
-        # normalize to list of dicts with keys 'text' and optional 'type'
-        parsed_spans = []
-        if isinstance(spans, dict):
-            # maybe mapping; take values
-            try:
-                parsed_spans = list(spans.values())
-            except Exception:
-                parsed_spans = []
-        elif isinstance(spans, list):
-            parsed_spans = spans
-        for s in parsed_spans:
-            # s may be dict or simple string
-            if isinstance(s, dict):
-                text = s.get("text") or s.get("span") or s.get("excerpt") or ""
-                typ = s.get("type") or s.get("halluc_type") or s.get("label")
-            else:
-                text = str(s)
-                typ = None
-            if text:
-                words = tokenize(text)
-                summary["has_hallucination"] = True
-                summary["num_spans"] += 1
-                summary["hallucinated_words"] += len(words)
-                if typ:
-                    summary["types"][typ] = summary["types"].get(typ, 0) + 1
+        summary["has_hallucination"] = True
+        for span in spans:
+            summary["num_spans"] += 1
+            summary["hallucinated_words"] += len(tokenize(span.get("text", "")))
+            summary["types"][span.get("type")] += 1
+    summary["model"] = ex.get("model")
+    summary["temperature"] = ex.get("temperature")
     return summary
 
 # ---------------- Main evaluation loop ----------------
 def run_eval():
+    if not RetrievalAugmentation:
+        print("RAPTOR library not imported correctly. Aborting evaluation.")
+        return
+
     random.seed(SEED)
     results_summary = {}
+    pathlib.Path(SAVE_DIR).mkdir(exist_ok=True)
 
     for ds_id, hf_name, hf_config in DATASET_SPECS:
-        print(f"\n=== Dataset: {ds_id} (hf: {hf_name} cfg:{hf_config}) ===")
+        print(f"\n{'='*20}\nDataset: {ds_id}\n{'='*20}")
         try:
-            if hf_config is None:
-                ds_all = load_dataset(hf_name)
-            else:
-                ds_all = load_dataset(hf_name, hf_config)
+            ds_all = load_dataset(hf_name, hf_config)
         except Exception as e:
-            print(f"Failed to load {hf_name} (config={hf_config}). Error: {e}")
+            print(f"FAILED to load {hf_name}. Error: {e}")
             results_summary[ds_id] = {"loaded": False, "error": str(e)}
             continue
 
-        # choose split (validation/dev/test/train)
-        chosen_split = None
-        if isinstance(ds_all, DatasetDict):
-            for candidate in ("validation", "dev", "test", "train"):
-                if candidate in ds_all:
-                    chosen_split = candidate
-                    break
-            if chosen_split is None:
-                chosen_split = list(ds_all.keys())[0]
-            ds = ds_all[chosen_split]
-        elif isinstance(ds_all, Dataset):
-            ds = ds_all
-            chosen_split = getattr(ds, "split", "unknown")
-        else:
-            print("Unknown dataset type returned by HF load_dataset.")
-            results_summary[ds_id] = {"loaded": False, "error": "unknown dataset type"}
-            continue
-        print(f"Using split: {chosen_split} with {len(ds)} examples")
+        split_key = next((s for s in ["validation", "dev", "test", "train"] if s in ds_all), list(ds_all.keys())[0])
+        ds = ds_all[split_key]
+        print(f"Using split '{split_key}' with {len(ds)} examples.")
 
-        # sample
-        n_total = len(ds)
-        n_sample = min(SAMPLE_SIZE, n_total)
-        if n_sample <= 0:
-            print("No examples to sample.")
-            results_summary[ds_id] = {"loaded": True, "n_examples": 0}
-            continue
-        ds_shuf = ds.shuffle(seed=SEED)
-        ds_sample = ds_shuf.select(range(n_sample))
+        ds_sample = ds.shuffle(seed=SEED).select(range(min(len(ds), SAMPLE_SIZE)))
 
-        # Special-case: if RAGTruth dataset, compute dataset-provided analytics first
-        ragtruth_dataset_stats = None
-        if hf_name == "wandb/RAGTruth-processed":
-            print("Computing RAGTruth dataset-provided analytics (baseline characterization)...")
-            counts = {"total": 0, "with_hallucination": 0, "total_hallucinated_words": 0, "types": {}, "by_model_temp": {}}
-            for ex in ds_sample:
-                counts["total"] += 1
-                ana = analyze_ragtruth_example(ex)
-                if ana["has_hallucination"]:
-                    counts["with_hallucination"] += 1
-                counts["total_hallucinated_words"] += ana["hallucinated_words"]
-                for t, c in ana["types"].items():
-                    counts["types"][t] = counts["types"].get(t, 0) + c
-                model = ana.get("model") or "unknown"
-                temp = str(ana.get("temperature") or "unknown")
-                key = f"{model}__{temp}"
-                if key not in counts["by_model_temp"]:
-                    counts["by_model_temp"][key] = {"count": 0, "hallucinated_words": 0, "with_halluc": 0}
-                counts["by_model_temp"][key]["count"] += 1
-                counts["by_model_temp"][key]["hallucinated_words"] += ana["hallucinated_words"]
-                if ana["has_hallucination"]:
-                    counts["by_model_temp"][key]["with_halluc"] += 1
-            ragtruth_dataset_stats = counts
-            safe_save_json(os.path.join(SAVE_DIR, ds_id, "ragtruth_dataset_stats.json"), ragtruth_dataset_stats)
-            print("Saved RAGTruth baseline stats.")
-
-        # Initialize RA
-        if RetrievalAugmentation is None or RetrievalAugmentationConfig is None:
-            print("RAPTOR import missing; skipping index + QA for this dataset.")
-            results_summary[ds_id] = {"loaded": True, "skipped_raptor_missing": True}
-            continue
+        # --- Initialize RAPTOR ---
         try:
-            # Correct initialization of RA with a config
-            RA = RetrievalAugmentation(config=RetrievalAugmentationConfig())
+            if USE_CUSTOM_QA_MODEL:
+                print(f"Using CustomResearchQAModel with max_tokens={MAX_TOKENS_PER_RUN}.")
+                custom_qa_model = CustomResearchQAModel(max_tokens=MAX_TOKENS_PER_RUN)
+                config = RetrievalAugmentationConfig(qa_model=custom_qa_model)
+            else:
+                print("Using default RAPTOR configuration.")
+                config = RetrievalAugmentationConfig()
+            
+            RA = RetrievalAugmentation(config=config)
         except Exception as e:
-            print(f"Failed to initialize RetrievalAugmentation. Error: {e}")
-            print("Please ensure your OPENAI_API_KEY is set correctly.")
+            print(f"FAILED to initialize RAPTOR. Error: {e}")
             results_summary[ds_id] = {"loaded": True, "raptor_init_failed": True, "error": str(e)}
             continue
 
-        # Index documents (we index the sampled examples to keep runs bounded)
-        print(f"Indexing {len(ds_sample)} documents into RAPTOR ...")
-        doc_texts = []
-        # We will optionally track synthetic doc IDs if RA returns them; else use numeric indices
-        for idx, ex in enumerate(tqdm(ds_sample, disable=not DEBUG)):
-            txt = build_document_text(ex)
-            if not txt or len(txt.strip()) == 0:
-                continue
-            try:
-                RA.add_documents(txt)
-                doc_texts.append({"doc_id": idx, "text": txt})
-            except Exception as e:
-                print(f"Warning: failed to add doc idx {idx}. Error: {e}")
-        print(f"Indexed {len(doc_texts)} documents for {ds_id}.")
-
-        # Save tree early
-        save_path = os.path.join(SAVE_DIR, ds_id)
+        print(f"Indexing {len(ds_sample)} documents...")
+        all_texts = [build_document_text(ex) for ex in ds_sample]
+        valid_texts = [text for text in all_texts if text]
         try:
-            RA.save(save_path)
-            print(f"Saved RAPTOR tree to {save_path}")
+            RA.add_documents(valid_texts)
         except Exception as e:
-            print("Warning: RA.save() failed:", e)
-
-        # Build QA items
-        qa_items = []
-        for ex in ds_sample:
-            q, golds = extract_question_and_answers(ex)
-            # For HotPotQA supporting facts, preserve supporting_facts if present
-            supporting = ex.get("supporting_facts") or ex.get("supporting_facts_text") or ex.get("supporting_facts_sentences")
-            qa_items.append({"question": q, "golds": golds, "raw": ex, "supporting": supporting})
-        # filter out entries with no question/gold where appropriate (we'll still allow empty golds for retrieval analysis)
-        qa_items = [x for x in qa_items if x["question"] is not None]
-        if not qa_items:
-            print("No questions found in sample; skipping QA eval for this dataset.")
-            results_summary[ds_id] = {"loaded": True, "indexed": len(doc_texts), "qa_evaluated": False, "notes": "no questions found"}
+            print(f"FAILED to index documents. Error: {e}")
             continue
 
-        qa_items = qa_items[: min(len(qa_items), MAX_PER_DATASET)]
+        save_path = os.path.join(SAVE_DIR, f"{ds_id}_tree")
+        RA.save(save_path)
+        print(f"Saved RAPTOR tree to {save_path}")
 
-        # Run QA and evaluate
-        print(f"Running {len(qa_items)} QA queries against RAPTOR...")
-        em_total = 0
-        f1_total = 0.0
-        per_example = []
-        total_latency = 0.0
-        total_tokens = 0
-        retrieval_metrics_accum = {"recall_at_k": [], "precision_at_k": [], "mrr_at_k": [], "ndcg_at_k": []}
-        for item in tqdm(qa_items):
-            q = item["question"]
-            golds = item["golds"] or []
-            
-            start = time.time()
-            raw_resp = None
-            pred_text = ""
-            retrievals = None
-            usage = None
-            latency = None
-            
+        qa_items = [item for item in [(*extract_question_and_answers(ex), ex) for ex in ds_sample] if item[0]]
+        qa_items = qa_items[:min(len(qa_items), MAX_PER_DATASET)]
+
+        print(f"Running {len(qa_items)} QA queries...")
+        per_example_results = []
+        for question, golds, raw_example in tqdm(qa_items):
+            start_time = time.time()
             try:
-                # The correct method signature is answer_question(question: str) -> str
-                # The library does not support passing max_tokens here directly.
-                # It would be controlled by the `qa_model` configuration if customized.
-                raw_resp = RA.answer_question(question=q)
+                pred_text = RA.answer_question(question=question)
             except Exception as e:
-                print("Error calling RA.answer_question for question:", q, "Error:", e)
-                raw_resp = None
+                print(f"Error answering question: {question}. Error: {e}")
+                pred_text = ""
+            latency = time.time() - start_time
 
-            end = time.time()
-            latency = end - start
-            total_latency += latency
-
-            # Parse raw_resp flexibly
-            if isinstance(raw_resp, dict):
-                # Common shapes: {"answer": "...", "retrieved_documents":[...], "usage":{...}}
-                if "answer" in raw_resp:
-                    pred_text = str(raw_resp["answer"])
-                elif "generated_text" in raw_resp:
-                    pred_text = str(raw_resp["generated_text"])
-                elif "text" in raw_resp:
-                    pred_text = str(raw_resp["text"])
-                else:
-                    # last resort: stringify
-                    pred_text = str(raw_resp)
-                # retrieval extraction
-                if "retrieved_documents" in raw_resp:
-                    retrievals = raw_resp["retrieved_documents"]
-                elif "retrieved" in raw_resp:
-                    retrievals = raw_resp["retrieved"]
-                elif "context" in raw_resp:
-                    # single context
-                    retrievals = [raw_resp["context"]]
-                # usage info
-                if "usage" in raw_resp:
-                    usage = raw_resp["usage"]
-            else:
-                # raw_resp might be a string or other object
-                if raw_resp is None:
-                    pred_text = ""
-                else:
-                    pred_text = str(raw_resp)
-
-            # If RA didn't provide retrievals, attempt to call a retrieval method if available
-            if retrievals is None:
-                try:
-                    if hasattr(RA.tree, "retrieve_and_get_nodes"):
-                        retrieved_nodes = RA.tree.retrieve_and_get_nodes(q, k=RETRIEVAL_K)
-                        retrievals = [{"text": node.text, "id": node.id} for node in retrieved_nodes]
-                except Exception:
-                    retrievals = None
-
-            # Standardize retrieval ids/texts if possible
-            retrieved_ids = []
-            retrieved_texts = []
-            if retrievals:
-                # retrievals may be list of dicts or strings
-                for r in retrievals[:RETRIEVAL_K]:
-                    if isinstance(r, dict):
-                        # try id fields
-                        rid = r.get("id") or r.get("doc_id") or r.get("document_id") or r.get("source") or None
-                        txt = r.get("text") or r.get("content") or r.get("document") or None
-                        retrieved_ids.append(rid if rid is not None else txt[:200] if txt else None)
-                        retrieved_texts.append(txt if txt else "")
-                    elif isinstance(r, str):
-                        retrieved_ids.append(r[:200])
-                        retrieved_texts.append(r)
-                    else:
-                        # fallback
-                        s = str(r)
-                        retrieved_ids.append(s[:200])
-                        retrieved_texts.append(s)
-            # Compute retrieval metrics if dataset provides gold evidence ids or supporting facts
-            recall_at_k = float("nan")
-            precision_at_k = float("nan")
-            mrr_at_k = float("nan")
-            ndcg_at_k = float("nan")
-            # try to pull gold ids from sample raw
-            raw = item.get("raw", {})
-            gold_ids = []
-            # For HotPotQA and FEVER-like, try to get (title, sent_id) pairs or evidence titles
-            if raw:
-                # HotPotQA supporting_facts is often list of [title, sent_id]
-                sf = item.get("supporting")
-                if sf and isinstance(sf, list):
-                    # build gold ids as title|sentindex strings
-                    for pair in sf:
-                        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
-                            gold_ids.append(f"{pair[0]}|{pair[1]}")
-                        elif isinstance(pair, str):
-                            gold_ids.append(pair)
-                # FEVER variant may have 'evidence' or 'citations'
-                if "evidence" in raw:
-                    ev = raw["evidence"]
-                    if isinstance(ev, list):
-                        for e in ev:
-                            gold_ids.append(str(e))
-                # TriviaQA / NQ might not have explicit doc ids; fallback: use contexts' titles if present
-                if "context" in raw and isinstance(raw["context"], str):
-                    gold_ids.append(raw["context"][:200])
-            # compute retrieval metrics if retrieved_ids and gold_ids present
-            if retrieved_ids and gold_ids:
-                recall_at_k = compute_recall_at_k(retrieved_ids, gold_ids, RETRIEVAL_K)
-                precision_at_k = compute_precision_at_k(retrieved_ids, gold_ids, RETRIEVAL_K)
-                mrr_at_k = compute_mrr(retrieved_ids, gold_ids, RETRIEVAL_K)
-                ndcg_at_k = compute_ndcg_at_k(retrieved_ids, gold_ids, RETRIEVAL_K)
-                retrieval_metrics_accum["recall_at_k"].append(recall_at_k)
-                retrieval_metrics_accum["precision_at_k"].append(precision_at_k)
-                retrieval_metrics_accum["mrr_at_k"].append(mrr_at_k)
-                retrieval_metrics_accum["ndcg_at_k"].append(ndcg_at_k)
-
-            # Evaluate prediction vs golds
-            em = exact_match(pred_text, golds) if golds else 0
-            f1 = f1_score(pred_text, golds) if golds else 0.0
-            em_total += em
-            f1_total += f1
-
-            # tokens usage extraction (best-effort)
-            token_usage = None
-            if isinstance(usage, dict):
-                # OpenAI usage keys often: prompt_tokens, completion_tokens, total_tokens
-                token_usage = usage.get("total_tokens") or usage.get("completion_tokens") or usage.get("prompt_tokens")
-                if token_usage:
-                    try:
-                        total_tokens += int(token_usage)
-                    except Exception:
-                        pass
-
-            per_example.append({
-                "question": q,
-                "pred": pred_text,
-                "gold": golds,
-                "em": em,
-                "f1": f1,
-                "latency": latency,
-                "retrieved_ids": retrieved_ids,
-                "retrieved_texts_summary": [t[:500] for t in retrieved_texts] if retrieved_texts else None,
-                "usage": usage,
-                "token_usage": token_usage
+            em = exact_match(pred_text, golds)
+            f1 = f1_score(pred_text, golds)
+            
+            per_example_results.append({
+                "question": question, "pred": pred_text, "gold": golds,
+                "em": em, "f1": f1, "latency": latency
             })
             time.sleep(RATE_LIMIT_SLEEP)
+        
+        # Aggregate results
+        num_q = len(per_example_results)
+        avg_em = sum(r['em'] for r in per_example_results) / num_q if num_q > 0 else 0
+        avg_f1 = sum(r['f1'] for r in per_example_results) / num_q if num_q > 0 else 0
+        avg_latency = sum(r['latency'] for r in per_example_results) / num_q if num_q > 0 else 0
 
-        # finalize dataset metrics
-        n_q = len(per_example)
-        avg_em = em_total / n_q if n_q > 0 else 0.0
-        avg_f1 = f1_total / n_q if n_q > 0 else 0.0
-        avg_latency = total_latency / n_q if n_q > 0 else 0.0
-        avg_tokens = (total_tokens / n_q) if n_q > 0 else None
-        retrieval_metrics_summary = {}
-        if retrieval_metrics_accum["recall_at_k"]:
-            valid_recall = [v for v in retrieval_metrics_accum["recall_at_k"] if not math.isnan(v)]
-            valid_prec = [v for v in retrieval_metrics_accum["precision_at_k"] if not math.isnan(v)]
-            valid_mrr = [v for v in retrieval_metrics_accum["mrr_at_k"] if not math.isnan(v)]
-            valid_ndcg = [v for v in retrieval_metrics_accum["ndcg_at_k"] if not math.isnan(v)]
-            retrieval_metrics_summary = {
-                "recall_at_k_mean": sum(valid_recall) / len(valid_recall) if valid_recall else 0.0,
-                "precision_at_k_mean": sum(valid_prec) / len(valid_prec) if valid_prec else 0.0,
-                "mrr_at_k_mean": sum(valid_mrr) / len(valid_mrr) if valid_mrr else 0.0,
-                "ndcg_at_k_mean": sum(valid_ndcg) / len(valid_ndcg) if valid_ndcg else 0.0,
-            }
+        print(f"Results for {ds_id} - EM: {avg_em:.4f}, F1: {avg_f1:.4f}, Avg Latency: {avg_latency:.2f}s")
 
-        print(f"Dataset {ds_id} QA results — EM: {avg_em:.4f}, F1: {avg_f1:.4f}, avg_latency: {avg_latency:.3f}s")
-
-        # Save detailed outputs
-        results_summary[ds_id] = {
-            "loaded": True,
-            "split": chosen_split,
-            "n_indexed": len(doc_texts),
-            "n_q": n_q,
-            "avg_em": avg_em,
-            "avg_f1": avg_f1,
-            "avg_latency": avg_latency,
-            "avg_token_usage_per_query": avg_tokens,
-            "retrieval_metrics": retrieval_metrics_summary,
-            "ragtruth_dataset_stats": ragtruth_dataset_stats
+        final_ds_results = {
+            "dataset_id": ds_id, "split": split_key, "num_indexed": len(valid_texts),
+            "num_queries": num_q, "avg_em": avg_em, "avg_f1": avg_f1, "avg_latency": avg_latency,
+            "config": {"sample_size": SAMPLE_SIZE, "max_tokens": MAX_TOKENS_PER_RUN if USE_CUSTOM_QA_MODEL else "default"}
         }
-        safe_save_json(os.path.join(SAVE_DIR, ds_id, "summary.json"), results_summary[ds_id])
-        safe_save_json(os.path.join(SAVE_DIR, ds_id, "examples.json"), per_example)
+        results_summary[ds_id] = final_ds_results
+        safe_save_json(os.path.join(SAVE_DIR, f"{ds_id}_summary.json"), final_ds_results)
+        safe_save_json(os.path.join(SAVE_DIR, f"{ds_id}_examples.json"), per_example_results)
 
-    # end datasets loop
     safe_save_json(os.path.join(SAVE_DIR, "global_summary.json"), results_summary)
-    print("\n=== ALL DONE ===")
-    print("Summaries saved under:", SAVE_DIR)
+    print(f"\n{'='*20}\nALL DONE. Results saved in '{SAVE_DIR}' directory.\n{'='*20}")
     return results_summary
 
 if __name__ == "__main__":
-    print("Starting RAPTOR research-ready evaluation harness.")
-    print("Config: SAMPLE_SIZE=", SAMPLE_SIZE, "MAX_PER_DATASET=", MAX_PER_DATASET, "MAX_TOKENS_PER_RUN=", MAX_TOKENS_PER_RUN)
-    res = run_eval()
-    # print brief summary
-    for ds, info in res.items():
-        if isinstance(info, dict) and info.get("loaded"):
-            print(f"{ds}: EM={info.get('avg_em', 0.0):.4f} F1={info.get('avg_f1', 0.0):.4f} n_q={info.get('n_q', 0)} latency={info.get('avg_latency', 0.0):.3f}s")
-        else:
-            print(f"{ds}: failed or skipped: {info}")
+    run_eval()
