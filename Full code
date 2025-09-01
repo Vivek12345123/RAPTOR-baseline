@@ -47,11 +47,12 @@ from tqdm import tqdm
 
 # Attempt to import RAPTOR
 try:
-    from raptor import RetrievalAugmentation
+    from raptor import RetrievalAugmentation, RetrievalAugmentationConfig
 except Exception as e:
     print("Warning: could not import raptor. Make sure raptor is installed/importable.")
     print("Import error:", e)
     RetrievalAugmentation = None
+    RetrievalAugmentationConfig = None
 
 # ------------------ KEY SLOT (EDIT LOCALLY ONLY) ------------------
 LOCAL_OPENAI_KEY = "PASTE_YOUR_OPENAI_KEY_HERE"  # <-- replace locally when running (temporary), then remove.
@@ -397,14 +398,16 @@ def run_eval():
             print("Saved RAGTruth baseline stats.")
 
         # Initialize RA
-        if RetrievalAugmentation is None:
+        if RetrievalAugmentation is None or RetrievalAugmentationConfig is None:
             print("RAPTOR import missing; skipping index + QA for this dataset.")
             results_summary[ds_id] = {"loaded": True, "skipped_raptor_missing": True}
             continue
         try:
-            RA = RetrievalAugmentation()
+            # Correct initialization of RA with a config
+            RA = RetrievalAugmentation(config=RetrievalAugmentationConfig())
         except Exception as e:
-            print("Failed to initialize RetrievalAugmentation:", e)
+            print(f"Failed to initialize RetrievalAugmentation. Error: {e}")
+            print("Please ensure your OPENAI_API_KEY is set correctly.")
             results_summary[ds_id] = {"loaded": True, "raptor_init_failed": True, "error": str(e)}
             continue
 
@@ -420,11 +423,7 @@ def run_eval():
                 RA.add_documents(txt)
                 doc_texts.append({"doc_id": idx, "text": txt})
             except Exception as e:
-                try:
-                    RA.add_documents([txt])
-                    doc_texts.append({"doc_id": idx, "text": txt})
-                except Exception as e2:
-                    print("Warning: failed to add doc idx", idx, "Err1:", e, "Err2:", e2)
+                print(f"Warning: failed to add doc idx {idx}. Error: {e}")
         print(f"Indexed {len(doc_texts)} documents for {ds_id}.")
 
         # Save tree early
@@ -462,52 +461,19 @@ def run_eval():
         for item in tqdm(qa_items):
             q = item["question"]
             golds = item["golds"] or []
-            # prepare kwargs for RA.answer_question; attempt to pass max_tokens param
-            kwargs = {"question": q}
-            # best-effort token limit pass
-            # Common possible param names: max_tokens, max_new_tokens, max_tokens_to_generate
-            # We'll try them in order inside RA call via small wrapper below.
+            
             start = time.time()
             raw_resp = None
             pred_text = ""
             retrievals = None
             usage = None
             latency = None
+            
             try:
-                # wrapper to attempt multiple param names
-                def call_answer(ra, kwargs_base):
-                    tried_signatures = []
-                    # try without token param first
-                    try:
-                        return ra.answer_question(**kwargs_base)
-                    except TypeError as te:
-                        tried_signatures.append(("no_token", str(te)))
-                    # try with various token param names
-                    token_param_names = ["max_tokens", "max_new_tokens", "max_tokens_to_generate", "max_output_tokens"]
-                    for pname in token_param_names:
-                        kb = dict(kwargs_base)
-                        kb[pname] = MAX_TOKENS_PER_RUN
-                        try:
-                            return ra.answer_question(**kb)
-                        except TypeError as te2:
-                            tried_signatures.append((pname, str(te2)))
-                            continue
-                    # fallback: try passing a 'generation_kwargs' dict if RA supports it
-                    try:
-                        kb = dict(kwargs_base)
-                        kb["generation_kwargs"] = {"max_tokens": MAX_TOKENS_PER_RUN}
-                        return ra.answer_question(**kb)
-                    except Exception as e:
-                        tried_signatures.append(("generation_kwargs", str(e)))
-                    # Last resort: call without kwargs (some RA APIs might accept positional)
-                    try:
-                        return ra.answer_question(q)
-                    except Exception as e:
-                        tried_signatures.append(("positional", str(e)))
-                    # If all fail, raise
-                    raise RuntimeError("RA.answer_question call failed for all tested signatures. attempts: " + str(tried_signatures))
-
-                raw_resp = call_answer(RA, kwargs)
+                # The correct method signature is answer_question(question: str) -> str
+                # The library does not support passing max_tokens here directly.
+                # It would be controlled by the `qa_model` configuration if customized.
+                raw_resp = RA.answer_question(question=q)
             except Exception as e:
                 print("Error calling RA.answer_question for question:", q, "Error:", e)
                 raw_resp = None
@@ -549,10 +515,9 @@ def run_eval():
             # If RA didn't provide retrievals, attempt to call a retrieval method if available
             if retrievals is None:
                 try:
-                    if hasattr(RA, "retrieve"):
-                        retrievals = RA.retrieve(q, k=RETRIEVAL_K)
-                    elif hasattr(RA, "get_retrieved"):
-                        retrievals = RA.get_retrieved(q, k=RETRIEVAL_K)
+                    if hasattr(RA.tree, "retrieve_and_get_nodes"):
+                        retrieved_nodes = RA.tree.retrieve_and_get_nodes(q, k=RETRIEVAL_K)
+                        retrievals = [{"text": node.text, "id": node.id} for node in retrieved_nodes]
                 except Exception:
                     retrievals = None
 
@@ -654,11 +619,15 @@ def run_eval():
         avg_tokens = (total_tokens / n_q) if n_q > 0 else None
         retrieval_metrics_summary = {}
         if retrieval_metrics_accum["recall_at_k"]:
+            valid_recall = [v for v in retrieval_metrics_accum["recall_at_k"] if not math.isnan(v)]
+            valid_prec = [v for v in retrieval_metrics_accum["precision_at_k"] if not math.isnan(v)]
+            valid_mrr = [v for v in retrieval_metrics_accum["mrr_at_k"] if not math.isnan(v)]
+            valid_ndcg = [v for v in retrieval_metrics_accum["ndcg_at_k"] if not math.isnan(v)]
             retrieval_metrics_summary = {
-                "recall_at_k_mean": sum(retrieval_metrics_accum["recall_at_k"]) / len(retrieval_metrics_accum["recall_at_k"]),
-                "precision_at_k_mean": sum(retrieval_metrics_accum["precision_at_k"]) / len(retrieval_metrics_accum["precision_at_k"]),
-                "mrr_at_k_mean": sum(retrieval_metrics_accum["mrr_at_k"]) / len(retrieval_metrics_accum["mrr_at_k"]),
-                "ndcg_at_k_mean": sum(retrieval_metrics_accum["ndcg_at_k"]) / len(retrieval_metrics_accum["ndcg_at_k"]),
+                "recall_at_k_mean": sum(valid_recall) / len(valid_recall) if valid_recall else 0.0,
+                "precision_at_k_mean": sum(valid_prec) / len(valid_prec) if valid_prec else 0.0,
+                "mrr_at_k_mean": sum(valid_mrr) / len(valid_mrr) if valid_mrr else 0.0,
+                "ndcg_at_k_mean": sum(valid_ndcg) / len(valid_ndcg) if valid_ndcg else 0.0,
             }
 
         print(f"Dataset {ds_id} QA results — EM: {avg_em:.4f}, F1: {avg_f1:.4f}, avg_latency: {avg_latency:.3f}s")
@@ -692,7 +661,6 @@ if __name__ == "__main__":
     # print brief summary
     for ds, info in res.items():
         if isinstance(info, dict) and info.get("loaded"):
-            print(f"{ds}: EM={info.get('avg_em'):.4f} F1={info.get('avg_f1'):.4f} n_q={info.get('n_q')} latency={info.get('avg_latency'):.3f}s")
+            print(f"{ds}: EM={info.get('avg_em', 0.0):.4f} F1={info.get('avg_f1', 0.0):.4f} n_q={info.get('n_q', 0)} latency={info.get('avg_latency', 0.0):.3f}s")
         else:
             print(f"{ds}: failed or skipped: {info}")
-
